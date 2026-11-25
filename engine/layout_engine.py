@@ -4,8 +4,9 @@ Provides deterministic layout calculations and FFmpeg filter graph generation
 for SPLIT, TRACK, and GENERAL reframing modes.
 """
 
+from contextlib import contextmanager
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 VALID_LAYOUT_MODES = {"SPLIT", "TRACK", "GENERAL", "SCREENCAST"}
 
@@ -199,31 +200,60 @@ def build_general_filter(
     return filter_str
 
 
+def build_screencast_filter(
+    orig_w: int,
+    orig_h: int,
+    out_w: int = 1080,
+    out_h: int = 1920,
+) -> str:
+    """
+    Generates FFmpeg filter complex string for SCREENCAST mode:
+    Preserves the full screen presentation without cropping over a blurred backdrop.
+    """
+    return (
+        f"[0:v]split=2[bg][fg];"
+        f"[bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{out_h},"
+        f"boxblur=luma_radius=20:luma_power=2[bg_blur];"
+        f"[fg]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fg_scaled];"
+        f"[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
+    )
+
+
 def build_track_crop_geometry(
     orig_w: int,
     orig_h: int,
     face_box: Optional[Tuple[float, float, float, float]] = None,
 ) -> Tuple[int, int, int, int]:
     """
-    Calculates 9:16 vertical crop (crop_w, crop_h, crop_x, crop_y) around face_box.
-    face_box is (x1, y1, x2, y2). If None, defaults to center of frame.
+    Calculates 9:16 vertical crop (crop_w, crop_h, crop_x, crop_y) around face_box,
+    clamping cleanly when source width is narrower than 9:16 of source height.
     """
     crop_h = orig_h
     crop_w = int(round(crop_h * (9.0 / 16.0)))
+    if crop_w > orig_w:
+        crop_w = orig_w
+        crop_h = min(orig_h, int(round(crop_w * (16.0 / 9.0))))
     crop_w -= crop_w % 2
     crop_h -= crop_h % 2
 
     if face_box:
         x1, y1, x2, y2 = face_box
         cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
     else:
         cx = orig_w / 2.0
+        cy = orig_h / 2.0
 
     x = int(round(cx - crop_w / 2.0))
     x = max(0, min(x, orig_w - crop_w))
     x -= x % 2
 
-    return crop_w, crop_h, x, 0
+    y = int(round(cy - crop_h / 2.0))
+    y = max(0, min(y, orig_h - crop_h))
+    y -= y % 2
+
+    return crop_w, crop_h, x, y
 
 
 def build_track_filter(
@@ -244,6 +274,30 @@ def build_track_filter(
     return filter_str
 
 
+@contextmanager
+def _open_yolo_capture(video_path: str) -> Iterator[Optional[Tuple[Any, Any, Any]]]:
+    """Loads YOLO model and opens VideoCapture, guaranteeing cap.release() on exit."""
+    try:
+        import cv2
+        from ultralytics import YOLO
+    except ImportError:
+        yield None
+        return
+
+    cap = None
+    try:
+        model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+        model = YOLO(model_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            yield None
+            return
+        yield cv2, model, cap
+    finally:
+        if cap is not None:
+            cap.release()
+
+
 def detect_person_box_yolo(
     video_path: str,
     start_sec: float,
@@ -257,64 +311,55 @@ def detect_person_box_yolo(
     Returns None if YOLO is unavailable, video cannot be opened, or no person is detected.
     """
     try:
-        import cv2
-        from ultralytics import YOLO
-    except ImportError:
-        return None
+        with _open_yolo_capture(video_path) as ctx:
+            if ctx is None:
+                return None
+            cv2, model, cap = ctx
 
-    try:
-        model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
-        model = YOLO(model_path)
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
+            sample_times = [
+                start_sec + duration_sec * 0.25,
+                start_sec + duration_sec * 0.50,
+                start_sec + duration_sec * 0.75,
+            ]
 
-        sample_times = [
-            start_sec + duration_sec * 0.25,
-            start_sec + duration_sec * 0.50,
-            start_sec + duration_sec * 0.75,
-        ]
+            detected_boxes = []
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        detected_boxes = []
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            for t in sample_times:
+                frame_num = int(t * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
 
-        for t in sample_times:
-            frame_num = int(t * fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                continue
+                results = model(frame, classes=[0], verbose=False)
+                if not results:
+                    continue
 
-            results = model(frame, classes=[0], verbose=False)
-            if not results:
-                continue
+                max_area = 0
+                best_box = None
+                for r in results:
+                    for b in r.boxes:
+                        coords = [float(x) for x in b.xyxy[0]]
+                        w = coords[2] - coords[0]
+                        h = coords[3] - coords[1]
+                        area = w * h
+                        if area > max_area:
+                            max_area = area
+                            best_box = (coords[0], coords[1], coords[2], coords[3])
 
-            max_area = 0
-            best_box = None
-            for r in results:
-                for b in r.boxes:
-                    coords = [float(x) for x in b.xyxy[0]]
-                    w = coords[2] - coords[0]
-                    h = coords[3] - coords[1]
-                    area = w * h
-                    if area > max_area:
-                        max_area = area
-                        best_box = (coords[0], coords[1], coords[2], coords[3])
+                if best_box:
+                    detected_boxes.append(best_box)
 
-            if best_box:
-                detected_boxes.append(best_box)
+            if not detected_boxes:
+                return None
 
-        cap.release()
+            avg_x1 = sum(b[0] for b in detected_boxes) / len(detected_boxes)
+            avg_y1 = sum(b[1] for b in detected_boxes) / len(detected_boxes)
+            avg_x2 = sum(b[2] for b in detected_boxes) / len(detected_boxes)
+            avg_y2 = sum(b[3] for b in detected_boxes) / len(detected_boxes)
 
-        if not detected_boxes:
-            return None
-
-        avg_x1 = sum(b[0] for b in detected_boxes) / len(detected_boxes)
-        avg_y1 = sum(b[1] for b in detected_boxes) / len(detected_boxes)
-        avg_x2 = sum(b[2] for b in detected_boxes) / len(detected_boxes)
-        avg_y2 = sum(b[3] for b in detected_boxes) / len(detected_boxes)
-
-        return (avg_x1, avg_y1, avg_x2, avg_y2)
+            return (avg_x1, avg_y1, avg_x2, avg_y2)
     except Exception as e:
         print(f"⚠️ [YOLO] Detection exception: {e}, falling back to center layout")
         return None
@@ -332,50 +377,42 @@ def detect_split_speakers_yolo(
     Returns (left_centre, right_centre) or (None, None) if detection falls back.
     """
     try:
-        import cv2
-        from ultralytics import YOLO
-    except ImportError:
-        return None, None
+        with _open_yolo_capture(video_path) as ctx:
+            if ctx is None:
+                return None, None
+            cv2, model, cap = ctx
 
-    try:
-        model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
-        model = YOLO(model_path)
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
+            mid_time = start_sec + duration_sec * 0.5
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(mid_time * fps))
+            ret, frame = cap.read()
+
+            if not ret or frame is None:
+                return None, None
+
+            results = model(frame, classes=[0], verbose=False)
+            if not results:
+                return None, None
+
+            persons = []
+            for r in results:
+                for b in r.boxes:
+                    coords = [float(x) for x in b.xyxy[0]]
+                    cx = (coords[0] + coords[2]) / 2.0
+                    cy = (coords[1] + coords[3]) / 2.0
+                    bw = coords[2] - coords[0]
+                    bh = coords[3] - coords[1]
+                    if bw > orig_w * 0.05:  # ignore small noise
+                        persons.append((cx, cy, bw, bh))
+
+            if len(persons) >= 2:
+                persons.sort(key=lambda p: p[0])
+                left = persons[0]
+                right = persons[-1]
+                if (right[0] - left[0]) > orig_w * 0.15:
+                    return left, right
+
             return None, None
-
-        mid_time = start_sec + duration_sec * 0.5
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(mid_time * fps))
-        ret, frame = cap.read()
-        cap.release()
-
-        if not ret or frame is None:
-            return None, None
-
-        results = model(frame, classes=[0], verbose=False)
-        if not results:
-            return None, None
-
-        persons = []
-        for r in results:
-            for b in r.boxes:
-                coords = [float(x) for x in b.xyxy[0]]
-                cx = (coords[0] + coords[2]) / 2.0
-                cy = (coords[1] + coords[3]) / 2.0
-                bw = coords[2] - coords[0]
-                bh = coords[3] - coords[1]
-                if bw > orig_w * 0.05:  # ignore small noise
-                    persons.append((cx, cy, bw, bh))
-
-        if len(persons) >= 2:
-            persons.sort(key=lambda p: p[0])
-            left = persons[0]
-            right = persons[-1]
-            if (right[0] - left[0]) > orig_w * 0.15:
-                return left, right
-
-        return None, None
     except Exception as e:
         print(f"⚠️ [YOLO] Split detection exception: {e}")
         return None, None

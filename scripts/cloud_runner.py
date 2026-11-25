@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-HYPIT_SHA = '1efedb925d375686ab107b6e67f914dced7b102b'
+HYPIT_SHA = 'e4abc8b246e72600fc186d881fa831074e1060f5'
 FAMILIES = {'STORYTELLING', 'PODCAST', 'JJ'}
 MAX_ASSET_BYTES = 2 * 1024**3
 MAX_TOTAL_BYTES = 4 * 1024**3

@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: hypit-ai/hypit
-          ref: 1efedb925d375686ab107b6e67f914dced7b102b
+          ref: e4abc8b246e72600fc186d881fa831074e1060f5
           path: hypit
           persist-credentials: false
       - name: Node 22

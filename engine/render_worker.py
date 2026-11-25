@@ -10,9 +10,6 @@ Executes the rendering pipeline in GitHub Actions cloud runner (Ubuntu 16GB RAM)
 
 import argparse
 import json
-import os
-import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -23,10 +20,11 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from layout_engine import (
+from layout_engine import (  # noqa: E402
     validate_job_manifest,
     build_split_filter,
     build_general_filter,
+    build_screencast_filter,
     build_track_filter,
     detect_person_box_yolo,
     detect_split_speakers_yolo,
@@ -34,11 +32,17 @@ from layout_engine import (
 
 
 def escape_ffmpeg_text(text: str) -> str:
-    """Escapes single quotes and special characters for FFmpeg drawtext."""
+    """Escapes special characters and apostrophes safely for FFmpeg single-quoted drawtext."""
     if not text:
         return ""
-    # Replace backslash first, then colon, single quote, percent
-    return str(text).replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'").replace("%", r"\%")
+    # Escape backslashes, colons, and percent signs first; then close/reopen single quotes for apostrophes.
+    return (
+        str(text)
+        .replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace("%", r"\%")
+        .replace("'", r"'\''")
+    )
 
 
 def escape_ffmpeg_path(path: str) -> str:
@@ -73,6 +77,8 @@ def build_ffmpeg_render_command(
             filter_complex = build_split_filter(1920, 1080, out_w, out_h)
         elif layout_mode == "TRACK":
             filter_complex = build_track_filter(1920, 1080, out_w, out_h)
+        elif layout_mode == "SCREENCAST":
+            filter_complex = build_screencast_filter(1920, 1080, out_w, out_h)
         else:
             filter_complex = build_general_filter(1920, 1080, out_w, out_h)
 
@@ -84,21 +90,21 @@ def build_ffmpeg_render_command(
         filter_complex += f";{current_label}subtitles='{escaped_sub}'[v_sub]"
         current_label = "[v_sub]"
 
-    # Chain hook overlay if enabled
+    # Chain hook overlay if enabled (Strict Zero-Background / Floating Typography Only)
     hook_cfg = manifest.get("hook_overlay", {})
     if hook_cfg.get("enabled", False) and hook_cfg.get("text"):
         hook_text = escape_ffmpeg_text(hook_cfg["text"])
         hook_dur = float(hook_cfg.get("duration_seconds", 4.0))
-        # Draw hook card at top third with safe margins
         drawtext_filter = (
             f";{current_label}drawtext=text='{hook_text}':"
-            f"fontcolor=white:fontsize=48:box=1:boxcolor=black@0.6:boxborderw=10:"
+            f"fontcolor=white:fontsize=48:borderw=3:bordercolor=black@0.9:"
+            f"shadowx=2:shadowy=2:shadowcolor=black@0.75:"
             f"x=(w-text_w)/2:y=240:enable='between(t,0,{hook_dur})'[v_hook]"
         )
         filter_complex += drawtext_filter
         current_label = "[v_hook]"
 
-    # Chain outro overlay if enabled
+    # Chain outro overlay if enabled (Strict Zero-Background / Floating Typography Only)
     outro_cfg = manifest.get("outro_overlay", {})
     if outro_cfg.get("enabled", False) and (outro_cfg.get("mandatory_text") or outro_cfg.get("text")):
         outro_text = escape_ffmpeg_text(outro_cfg.get("mandatory_text") or outro_cfg.get("text", ""))
@@ -106,7 +112,8 @@ def build_ffmpeg_render_command(
         outro_start = max(0.0, duration_sec - outro_dur)
         drawtext_outro = (
             f";{current_label}drawtext=text='{outro_text}':"
-            f"fontcolor=white:fontsize=44:box=1:boxcolor=black@0.75:boxborderw=12:"
+            f"fontcolor=white:fontsize=44:borderw=3:bordercolor=black@0.9:"
+            f"shadowx=2:shadowy=2:shadowcolor=black@0.75:"
             f"x=(w-text_w)/2:y=h-360:enable='between(t,{outro_start:.2f},{duration_sec:.2f})'[v_outro]"
         )
         filter_complex += drawtext_outro
@@ -136,7 +143,7 @@ def build_ffmpeg_render_command(
 
 
 def probe_video_dimensions(video_path: str) -> Tuple[int, int]:
-    """Probes video width and height using ffprobe."""
+    """Probes video width and height using ffprobe; fails closed on error."""
     try:
         cmd = [
             "ffprobe",
@@ -146,12 +153,16 @@ def probe_video_dimensions(video_path: str) -> Tuple[int, int]:
             "-of", "csv=p=0:s=x",
             video_path,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
         parts = res.stdout.strip().split("x")
-        return int(parts[0]), int(parts[1])
-    except Exception:
-        # Fallback to standard 1080p 16:9
-        return 1920, 1080
+        if len(parts) != 2:
+            raise ValueError(f"Unexpected ffprobe output: {res.stdout!r}")
+        width, height = int(parts[0]), int(parts[1])
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid video dimensions: {width}x{height}")
+        return width, height
+    except Exception as exc:
+        raise RuntimeError(f"Failed to probe video dimensions for {video_path}: {exc}") from exc
 
 
 def verify_rendered_mp4(
@@ -255,6 +266,9 @@ def run_worker(manifest_path: str, output_path: str) -> int:
         print("🎯 [WORKER] Running YOLOv8 face/person tracking for TRACK layout...")
         face_box = detect_person_box_yolo(input_file, start_sec, dur_sec, in_w, in_h)
         fgraph = build_track_filter(in_w, in_h, out_w, out_h, face_box=face_box)
+    elif layout_mode == "SCREENCAST":
+        print("🖥️ [WORKER] Building SCREENCAST full-frame backdrop filtergraph...")
+        fgraph = build_screencast_filter(in_w, in_h, out_w, out_h)
     else:
         print("🖼️ [WORKER] Building GENERAL blurred background filtergraph...")
         fgraph = build_general_filter(in_w, in_h, out_w, out_h)

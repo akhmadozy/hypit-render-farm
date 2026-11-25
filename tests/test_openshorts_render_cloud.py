@@ -3,7 +3,7 @@ Unit tests for OpenShorts Cloud Render Orchestrator (openshorts_render_cloud.py)
 """
 
 import json
-import subprocess
+import re
 import sys
 import pytest
 from pathlib import Path
@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.openshorts_render_cloud import (
+from scripts.openshorts_render_cloud import (  # noqa: E402
     DEFAULT_REPO,
     DEFAULT_WORKFLOW,
     check_github_rate_limit,
@@ -312,3 +312,71 @@ def test_openshorts_workflow_security_and_env_binding():
     assert download_step["env"]["RELEASE_TAG"] == "${{ inputs.release_tag }}"
     assert '"$RELEASE_TAG"' in download_step["run"]
     assert any("python3 engine/render_worker.py" in s.get("run", "") for s in steps)
+
+
+def test_verify_final_mp4_fails_closed_on_wrong_resolution(tmp_path):
+    mp4 = tmp_path / "wrong_res.mp4"
+    mp4.write_bytes(b"dummy")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="1920x1080\n", stderr="")
+        assert verify_final_mp4(str(mp4)) is False
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="probe error")
+        assert verify_final_mp4(str(mp4)) is False
+
+
+def test_url_source_with_custom_subtitles_file_path_staging(tmp_path, valid_manifest_dict):
+    from scripts.openshorts_render_cloud import run_orchestrator
+
+    sub_dir = tmp_path / "captions"
+    sub_dir.mkdir()
+    custom_sub = sub_dir / "custom_hook.srt"
+    custom_sub.write_text("1\n00:00:00,000 --> 00:00:02,000\nHalo\n", encoding="utf-8")
+
+    manifest = dict(valid_manifest_dict)
+    manifest["subtitles"] = {"enabled": True, "file_path": "captions/custom_hook.srt"}
+    manifest_path = tmp_path / "job_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with patch("scripts.openshorts_render_cloud.check_github_rate_limit"), \
+         patch("scripts.openshorts_render_cloud.create_temporary_asset_release", return_value="temp-tag-sub") as mock_create, \
+         patch("scripts.openshorts_render_cloud.delete_temporary_asset_release", return_value=True), \
+         patch("scripts.openshorts_render_cloud.find_latest_run_id", side_effect=["10", "11"]), \
+         patch("scripts.openshorts_render_cloud.trigger_workflow_run", return_value=True), \
+         patch("scripts.openshorts_render_cloud.watch_run_with_timeout", return_value=True), \
+         patch("scripts.openshorts_render_cloud.download_rendered_artifact", return_value=True), \
+         patch("scripts.openshorts_render_cloud.verify_final_mp4", return_value=True):
+        code = run_orchestrator(
+            manifest_path=str(manifest_path),
+            output_path=str(tmp_path / "out.mp4"),
+            repo_name="akhmadozy/hypit-render-farm",
+            workflow_name="openshorts-render.yml",
+        )
+        assert code == 0
+        mock_create.assert_called_once()
+        staged = mock_create.call_args[0][2]
+        assert str(custom_sub.resolve()) in staged
+
+
+def test_openshorts_workflow_actions_pinned_to_commit_sha():
+    import yaml
+
+    wf_path = REPO_ROOT / ".github/workflows/openshorts-render.yml"
+    wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+    for step in wf["jobs"]["render"]["steps"]:
+        uses = step.get("uses")
+        if uses:
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), f"Action not pinned to 40-char SHA: {uses}"
+
+
+def test_requirements_upper_bounded():
+    req_lines = [
+        line.strip()
+        for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for pkg in ("ultralytics", "opencv-python-headless", "torch", "numpy", "jsonschema", "pyyaml", "requests", "pytest"):
+        matched = [line for line in req_lines if line.lower().startswith(pkg)]
+        assert matched and "<" in matched[0], f"Missing upper bound for {pkg}: {matched}"

@@ -20,7 +20,7 @@ The canonical dispatcher is the Clipper Worker. It saves the exact GitHub run ID
 ### Execution Flow
 
 1. Worker validates rights/source evidence, bounded revision and free-tier quota; persists the job and dispatches `.github/workflows/render.yml` with only `job_id`.
-2. Runner authenticates the exact job using fresh GitHub OIDC, then installs frozen dependencies from Hypit commit `1efedb925d375686ab107b6e67f914dced7b102b`.
+2. Runner authenticates the exact job using fresh GitHub OIDC, then installs frozen dependencies from Hypit `v0.3.5` commit `e4abc8b246e72600fc186d881fa831074e1060f5`.
 3. Runner streams authorized source objects, verifies their SHA-256 and size, and executes the requested phase.
 4. Runner uploads private artifact receipts, then submits the result for that exact revision. Failed, stale or cancelled jobs cannot become publishable through runner claims.
 

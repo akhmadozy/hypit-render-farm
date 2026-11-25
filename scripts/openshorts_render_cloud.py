@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure layout_engine is importable
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -24,7 +24,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine.layout_engine import validate_job_manifest
+from engine.layout_engine import validate_job_manifest  # noqa: E402
 
 DEFAULT_REPO = "akhmadozy/hypit-render-farm"
 DEFAULT_WORKFLOW = "openshorts-render.yml"
@@ -231,11 +231,14 @@ def download_rendered_artifact(repo_name: str, run_id: str, output_path: str) ->
     return True
 
 
-def verify_final_mp4(output_path: str) -> bool:
+def verify_final_mp4(
+    output_path: str,
+    expected_resolution: Optional[Tuple[int, int]] = (1080, 1920),
+) -> bool:
     """
     Tri-Level QA bitstream verification for final rendered video:
     1. File existence & size > 0 bytes.
-    2. ffprobe dimensions 1080x1920 (9:16 vertical).
+    2. ffprobe dimensions match expected_resolution (default 1080x1920 vertical, fail-closed).
     3. ffmpeg null-muxer decode integrity check.
     """
     p = Path(output_path)
@@ -244,7 +247,7 @@ def verify_final_mp4(output_path: str) -> bool:
         return False
 
     try:
-        # Check resolution
+        # Check resolution (fail-closed)
         probe_cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -253,9 +256,16 @@ def verify_final_mp4(output_path: str) -> bool:
             str(p),
         ]
         res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode != 0:
+            print(f"❌ [QA] ffprobe failed: {res.stderr.strip()}")
+            return False
+
         dim = res.stdout.strip()
-        if "1080x1920" not in dim:
-            print(f"⚠️ [QA] Resolution is {dim}, expected 1080x1920 vertical.")
+        if expected_resolution:
+            exp_dim = f"{expected_resolution[0]}x{expected_resolution[1]}"
+            if dim != exp_dim:
+                print(f"❌ [QA] Resolution mismatch: got '{dim}', expected '{exp_dim}'.")
+                return False
 
         # Decode integrity test
         dec_cmd = ["ffmpeg", "-v", "error", "-i", str(p), "-f", "null", "-"]
@@ -315,15 +325,29 @@ def run_orchestrator(
             return 1
         local_files.append(str(Path(local_path).resolve()))
 
-    # Check for local subtitles next to manifest or in raw/
+    # Check for explicit custom subtitles.file_path or default subtitles next to manifest / in raw/
     manifest_dir = Path(manifest_path).resolve().parent
+    subs_cfg = manifest.get("subtitles", {})
+    custom_sub_path = subs_cfg.get("file_path") if isinstance(subs_cfg, dict) and subs_cfg.get("enabled", False) else None
+    if isinstance(custom_sub_path, str) and custom_sub_path.strip():
+        raw_sub = Path(custom_sub_path.strip())
+        sub_candidates = [raw_sub] if raw_sub.is_absolute() else [manifest_dir / raw_sub, raw_sub]
+        for sub_cand in sub_candidates:
+            if sub_cand.is_file():
+                resolved_sub = str(sub_cand.resolve())
+                if resolved_sub not in local_files:
+                    local_files.append(resolved_sub)
+                break
+
     for sub_name in ["subtitles.srt", "subtitles.ass"]:
         for candidate_path in [
             manifest_dir / sub_name,
             manifest_dir / "raw" / sub_name,
         ]:
-            if candidate_path.is_file() and str(candidate_path) not in local_files:
-                local_files.append(str(candidate_path))
+            if candidate_path.is_file():
+                resolved_sub = str(candidate_path.resolve())
+                if resolved_sub not in local_files:
+                    local_files.append(resolved_sub)
                 break
 
     if local_files:
