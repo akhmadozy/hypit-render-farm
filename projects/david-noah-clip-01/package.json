@@ -1,9 +1,0 @@
-{
-  "name": "david-noah-clip-01",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "hypit": {
-    "project": true
-  }
-}

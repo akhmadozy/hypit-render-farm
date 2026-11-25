@@ -20,6 +20,12 @@ hypit/
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Project Data & Local Models (Zero Project Data Rule)
+projects/
+*.pt
+*.onnx
 
 # OS Specific
 .DS_Store

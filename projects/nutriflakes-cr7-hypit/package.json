@@ -1,9 +1,0 @@
-{
-  "name": "nutriflakes-cr7-hypit",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "hypit": {
-    "project": true
-  }
-}
