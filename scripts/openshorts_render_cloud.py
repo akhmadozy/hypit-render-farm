@@ -335,62 +335,58 @@ def run_orchestrator(
             print(f"❌ Failed to stage assets to GitHub Release: {e}")
             return 1
 
-    # 4. Trigger workflow run
-    print("🚀 [STAGE 3] Dispatching workflow run to GitHub Actions...")
-    # Get previous latest run id so we don't accidentally attach to an old run
-    old_run_id = find_latest_run_id(repo_name, workflow_name, max_wait_seconds=2)
+    try:
+        # 4. Trigger workflow run
+        print("🚀 [STAGE 3] Dispatching workflow run to GitHub Actions...")
+        # Get previous latest run id so we don't accidentally attach to an old run
+        old_run_id = find_latest_run_id(repo_name, workflow_name, max_wait_seconds=2)
 
-    manifest_json_str = json.dumps(manifest)
-    inputs = {
-        "manifest": manifest_json_str,
-        "release_tag": release_tag,
-    }
+        manifest_json_str = json.dumps(manifest)
+        inputs = {
+            "manifest": manifest_json_str,
+            "release_tag": release_tag,
+        }
 
-    if not trigger_workflow_run(repo_name, workflow_name, inputs):
+        if not trigger_workflow_run(repo_name, workflow_name, inputs):
+            return 1
+
+        print("⏳ Waiting for GitHub Actions run to register...")
+        run_id = find_latest_run_id(
+            repo_name,
+            workflow_name,
+            exclude_run_id=old_run_id,
+            max_wait_seconds=30,
+        )
+        if not run_id:
+            print("❌ Could not determine dispatched run ID!")
+            return 1
+
+        print(f"🎯 [STAGE 4] Dispatched Run ID: {run_id}")
+
+        # 5. Watch execution
+        timeout_seconds = timeout_minutes * 60
+        success = watch_run_with_timeout(repo_name, run_id, timeout_seconds=timeout_seconds)
+
+        if not success:
+            print(f"❌ Cloud execution failed or timed out for run {run_id}!")
+            return 1
+
+        # 6. Download artifact & verify
+        print(f"📥 [STAGE 5] Downloading rendered artifact to: {output_path}")
+        if not download_rendered_artifact(repo_name, run_id, output_path):
+            print("❌ Failed to download or extract MP4 artifact!")
+            return 1
+
+        print("🔍 [STAGE 6] Verifying final MP4...")
+        if not verify_final_mp4(output_path):
+            print("❌ Tri-Level QA verification failed!")
+            return 1
+
+        print(f"🎉 Cloud render completed successfully: {output_path}")
+        return 0
+    finally:
         if release_tag:
             delete_temporary_asset_release(repo_name, release_tag)
-        return 1
-
-    print("⏳ Waiting for GitHub Actions run to register...")
-    run_id = find_latest_run_id(
-        repo_name,
-        workflow_name,
-        exclude_run_id=old_run_id,
-        max_wait_seconds=30,
-    )
-    if not run_id:
-        print("❌ Could not determine dispatched run ID!")
-        if release_tag:
-            delete_temporary_asset_release(repo_name, release_tag)
-        return 1
-
-    print(f"🎯 [STAGE 4] Dispatched Run ID: {run_id}")
-
-    # 5. Watch execution
-    timeout_seconds = timeout_minutes * 60
-    success = watch_run_with_timeout(repo_name, run_id, timeout_seconds=timeout_seconds)
-
-    # Clean up ephemeral release tag regardless of run success
-    if release_tag:
-        delete_temporary_asset_release(repo_name, release_tag)
-
-    if not success:
-        print(f"❌ Cloud execution failed or timed out for run {run_id}!")
-        return 1
-
-    # 6. Download artifact & verify
-    print(f"📥 [STAGE 5] Downloading rendered artifact to: {output_path}")
-    if not download_rendered_artifact(repo_name, run_id, output_path):
-        print("❌ Failed to download or extract MP4 artifact!")
-        return 1
-
-    print("🔍 [STAGE 6] Verifying final MP4...")
-    if not verify_final_mp4(output_path):
-        print("❌ Tri-Level QA verification failed!")
-        return 1
-
-    print(f"🎉 Cloud render completed successfully: {output_path}")
-    return 0
 
 
 def main():

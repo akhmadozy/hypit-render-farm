@@ -60,9 +60,10 @@ jobs:
         if: "${{ inputs.release_tag != '' }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          echo "Downloading assets from release tag: ${{ inputs.release_tag }}"
-          gh release download "${{ inputs.release_tag }}" --dir .
+          echo "Downloading assets from release tag: $RELEASE_TAG"
+          gh release download "$RELEASE_TAG" --dir .
 
       - name: Parse & Prepare Job Manifest
         run: |

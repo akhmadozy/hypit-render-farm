@@ -263,3 +263,52 @@ def test_validate_sample_podcast_manifest_fixture():
     manifest = validate_manifest_file(str(fixture_path))
     assert manifest["project_id"] == "PODCAST-SAMPLE-CLIP01"
     assert manifest["layout"]["mode"] == "SPLIT"
+
+
+@pytest.mark.parametrize("failing_stage", ["watch_run_with_timeout", "download_rendered_artifact"])
+def test_ephemeral_release_cleaned_up_on_exception(tmp_path, valid_manifest_dict, failing_stage):
+    from scripts.openshorts_render_cloud import run_orchestrator
+
+    manifest_path = tmp_path / "job_manifest.json"
+    manifest_path.write_text(json.dumps(valid_manifest_dict), encoding="utf-8")
+    sub_file = tmp_path / "subtitles.srt"
+    sub_file.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+
+    watch_kwargs = {"side_effect": RuntimeError("watch interrupted")} if failing_stage == "watch_run_with_timeout" else {"return_value": True}
+    dl_kwargs = {"side_effect": RuntimeError("download failed")} if failing_stage == "download_rendered_artifact" else {"return_value": True}
+
+    with patch("scripts.openshorts_render_cloud.check_github_rate_limit"), \
+         patch("scripts.openshorts_render_cloud.create_temporary_asset_release", return_value="temp-assets-tag-1"), \
+         patch("scripts.openshorts_render_cloud.delete_temporary_asset_release", return_value=True) as mock_delete, \
+         patch("scripts.openshorts_render_cloud.find_latest_run_id", side_effect=["5555", "5556"]), \
+         patch("scripts.openshorts_render_cloud.trigger_workflow_run", return_value=True), \
+         patch("scripts.openshorts_render_cloud.watch_run_with_timeout", **watch_kwargs), \
+         patch("scripts.openshorts_render_cloud.download_rendered_artifact", **dl_kwargs):
+
+        with pytest.raises(RuntimeError):
+            run_orchestrator(
+                manifest_path=str(manifest_path),
+                output_path=str(tmp_path / "out.mp4"),
+                repo_name="akhmadozy/hypit-render-farm",
+                workflow_name="openshorts-render.yml",
+            )
+
+        mock_delete.assert_called_once_with("akhmadozy/hypit-render-farm", "temp-assets-tag-1")
+
+
+def test_openshorts_workflow_security_and_env_binding():
+    import yaml
+
+    wf_path = REPO_ROOT / ".github/workflows/openshorts-render.yml"
+    wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+    assert wf["permissions"] == {"contents": "read"}
+
+    steps = wf["jobs"]["render"]["steps"]
+    for step in steps:
+        run_block = step.get("run", "")
+        assert "${{ inputs." not in run_block, f"Direct inputs interpolation found in step {step.get('name')}"
+
+    download_step = next(s for s in steps if s.get("name") == "Download Ephemeral Assets from GitHub Release")
+    assert download_step["env"]["RELEASE_TAG"] == "${{ inputs.release_tag }}"
+    assert '"$RELEASE_TAG"' in download_step["run"]
+    assert any("python3 engine/render_worker.py" in s.get("run", "") for s in steps)
